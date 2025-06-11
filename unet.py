@@ -54,50 +54,36 @@ class Block(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, img_channels=3, down_channels=(64, 128, 256, 512), up_channels=(512, 256, 128, 64), time_emb_dim=32):
+    def __init__(self, img_channels=4, down_channels=(64, 128, 256, 512), up_channels=(512, 256, 128, 64), time_emb_dim=32):
         super().__init__()
 
         self.time_mlp = SinusoidalPositionEmbeddings(time_emb_dim)
 
-        # Initial convolution
         self.init_conv = nn.Conv2d(img_channels, down_channels[0], kernel_size=3, padding=1)
 
-        # Encoder Path
         self.downs = nn.ModuleList()
         self.downsamplers = nn.ModuleList()
         for i in range(len(down_channels) -1):
             self.downs.append(Block(down_channels[i], down_channels[i+1], time_emb_dim))
             self.downsamplers.append(nn.MaxPool2d(2))
         
-        # Bottleneck
         self.mid_block1 = Block(down_channels[-1], down_channels[-1], time_emb_dim)
         self.mid_block2 = Block(down_channels[-1], down_channels[-1], time_emb_dim)
 
-        # Decoder Path
         self.ups = nn.ModuleList()
         self.upsamplers = nn.ModuleList()
         
-        # Reverse down_channels to define up_channels correctly for skip connections
-        reversed_down_channels = down_channels[::-1] # e.g. (512, 256, 128, 64)
+        reversed_down_channels = down_channels[::-1] 
 
         for i in range(len(up_channels)):
-            prev_up_channel = down_channels[-1] if i == 0 else up_channels[i-1] # Output from bottleneck or previous up-block
+            prev_up_channel = down_channels[-1] if i == 0 else up_channels[i-1] 
             
-            # The channel size of the skip connection corresponding to this upsampling level
-            # skip_connections after reversing are [d2_out, d1_out, d0_out, init_out]
-            # These have channels from reversed_down_channels:
-            # reversed_down_channels[0] = 512 (for i=0)
-            # reversed_down_channels[1] = 256 (for i=1)
-            # ...
             actual_skip_channel_size = reversed_down_channels[i]
 
             self.upsamplers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
-            # The input to this block is prev_up_channel (from upsampled x) + actual_skip_channel_size (from skip connection)
-            # The output of this block is up_channels[i]
             self.ups.append(Block(prev_up_channel + actual_skip_channel_size, up_channels[i], time_emb_dim))
 
 
-        # Final output layer
         self.final_conv = nn.Conv2d(up_channels[-1], img_channels, kernel_size=1)
 
     def forward(self, x, timestep):
@@ -105,59 +91,36 @@ class UNet(nn.Module):
 
         # Encoder Path
         x = self.init_conv(x)
-        skip_connections = [x] # Store initial conv output as first "skip"
+        skip_connections = [x]
 
         for i in range(len(self.downs)):
             x = self.downs[i](x, t_emb)
             skip_connections.append(x)
             x = self.downsamplers[i](x)
-        
-        # Bottleneck
+            
         x = self.mid_block1(x, t_emb)
         x = self.mid_block2(x, t_emb)
 
-        # Decoder Path
-        # Reverse skip connections for easier pop
         skip_connections = skip_connections[::-1]
 
         for i in range(len(self.ups)):
             x = self.upsamplers[i](x)
-            # The skip connection should correspond to the resolution before downsampling.
-            # self.downs has N elements, self.downsamplers has N elements
-            # skip_connections has N+1 elements (init_conv + N down blocks)
-            # e.g., down_channels=(64, 128, 256, 512) -> len=4
-            # self.downs has 3 elements: (64->128), (128->256), (256->512)
-            # skip_connections: init_conv_out (64), down0_out (128), down1_out (256), down2_out (512)
-            # reversed_skip_connections: down2_out (512), down1_out (256), down0_out (128), init_conv_out (64)
-            
-            # up_channels=(512, 256, 128, 64) -> len=4
-            # up0: takes bottleneck (512), skip is down2_out (512). Concat = 1024. Block out 512.
-            # up1: takes up0_out (512), skip is down1_out (256). Concat = 768. Block out 256.
-            # up2: takes up1_out (256), skip is down0_out (128). Concat = 384. Block out 128.
-            # up3: takes up2_out (128), skip is init_conv_out (64). Concat = 192. Block out 64.
+            skip = skip_connections[i] 
 
-            skip = skip_connections[i] # First skip is the deepest one from encoder
-            
-            # Ensure spatial dimensions match for concatenation
-            if x.shape[-2:] != skip.shape[-2:]: # Check H, W
-                # This can happen if MaxPool2d rounds down and Upsample rounds up differently.
-                # A common fix is to use ConvTranspose2d for upsampling or ensure padding/stride in MaxPool2d
-                # For now, let's try padding x to match skip. This is a simplistic fix.
-                # A better solution might be to use specific output_padding in ConvTranspose2d or ensure sizes align.
+            if x.shape[-2:] != skip.shape[-2:]:
                 target_size = skip.shape[-2:]
                 x = nn.functional.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
 
-            x = torch.cat((x, skip), dim=1) # Concatenate along channel dimension
+            x = torch.cat((x, skip), dim=1) 
             x = self.ups[i](x, t_emb)
             
         return self.final_conv(x)
 
 
 if __name__ == '__main__':
-    # Test SinusoidalPositionEmbeddings
     print("Testing SinusoidalPositionEmbeddings...")
     time_emb_dim = 32
-    dummy_time_input = torch.randint(0, 1000, (4,)).float() # batch_size = 4
+    dummy_time_input = torch.randint(0, 1000, (4,)).float()
     pos_embedder = SinusoidalPositionEmbeddings(time_emb_dim)
     time_embeddings = pos_embedder(dummy_time_input)
     print(f"Input time shape: {dummy_time_input.shape}")
@@ -181,7 +144,7 @@ if __name__ == '__main__':
 
     # Test UNet
     print("Testing UNet...")
-    img_channels = 3
+    img_channels = 4
     model = UNet(img_channels=img_channels, time_emb_dim=time_emb_dim)
     
     batch_size = 4
